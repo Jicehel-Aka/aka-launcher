@@ -1,8 +1,8 @@
 // Launcher Gamebuino AKA
 //
-// Tourne depuis la partition app1 (OTA_1). Liste les applications de la carte
-// SD (un dossier par application), installe celle qu'on choisit dans app0 et
-// redemarre dessus.
+// Runs from the "test" partition (0x10000). Lists the applications on the SD card
+// (one folder per application), installs the chosen one into the "factory"
+// partition (0x100000) and restarts into it.
 //
 // Touches :
 //   HAUT / BAS     naviguer             L1 / R1       page precedente / suivante
@@ -17,10 +17,9 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 
-#include "gb_core.h"
-#include "gb_graphics.h"
-#include "gb_ll_sdcard.h"
+#include "gamebuino.h"
 
+#include "breakout.h"
 #include "catalog.h"
 #include "flasher.h"
 #include "i18n.h"
@@ -29,14 +28,17 @@
 
 gb_core     g_core;
 gb_graphics gfx;
+#if USE_WIFI_STREAM
+gb_stream_wifi      stream_wifi;
+#endif
 
 using namespace launcher;
 
 namespace {
 
 
-Catalog g_catalog;
-Ui      g_ui;
+EXT_RAM_BSS_ATTR Catalog g_catalog;
+EXT_RAM_BSS_ATTR  Ui      g_ui;
 
 constexpr uint16_t kAnyKey = GB_KEY_RUN | GB_KEY_MENU | GB_KEY_L1 | GB_KEY_R1 | GB_KEY_UP | GB_KEY_DOWN |
                              GB_KEY_LEFT | GB_KEY_RIGHT | GB_KEY_A | GB_KEY_B | GB_KEY_C | GB_KEY_D;
@@ -49,24 +51,19 @@ void showMessage(const char* title, const char* text, bool error)
 {
     g_ui.drawMessage(title, text, error);
     gfx.update();
+#if USE_WIFI_STREAM
+    stream_wifi.update();
+#endif
     // attendre le relachement puis une nouvelle pression
     while (true) { g_core.pool(); if (!held()) break; g_core.delay_ms(10); }
     while (true) { g_core.pool(); if (pressed() & kAnyKey) break; g_core.delay_ms(10); }
 }
 
-// Message d'erreur d'installation : texte traduit + details techniques (etape, code,
-// relecture flash) pour pouvoir diagnostiquer sans cable serie.
-void showFlashError(FlashResult r)
-{
-    char msg[320];
-    snprintf(msg, sizeof msg, "%s\n \n%s", tr(errorKey(r)), lastErrorDetail());
-    showMessage(tr("LAUNCHER_ERROR"), msg, true);
-}
-
 bool mountCard()
 {
-    if (gb_ll_sd_is_mounted()) return true;
-    return gb_ll_sd_init() == GB_OK;
+//    if (gb_ll_sd_is_mounted()) return true;
+//    return gb_ll_sd_init() == GB_OK;
+    return true;
 }
 
 // Rescanne la carte ; retourne true si elle est lisible.
@@ -80,10 +77,45 @@ bool rescan(int* selected)
     return true;
 }
 
+// Message d'erreur d'installation : texte traduit + details techniques (etape, code, relecture
+// de la flash) pour pouvoir diagnostiquer sans cable serie.
+void showFlashError(FlashResult r)
+{
+    char msg[320];
+    snprintf(msg, sizeof msg, "%s\n \n%s", tr(errorKey(r)), lastErrorDetail());
+    showMessage(tr("LAUNCHER_ERROR"), msg, true);
+}
+
+// Launcher installed in "test": ask the user to power off, then wait forever.
+[[noreturn]] void waitPowerOff()
+{
+    g_ui.drawMessage(tr("LAUNCHER_DONE"), tr("LAUNCHER_POWER_OFF"), false);
+    gfx.update();
+    while (true)
+    { 
+        g_core.pool(); // update buttons, include power off ;)
+        g_core.delay_ms(10);
+    }
+}
+
+// Fin d'une auto-installation : disposition loader/game = eteindre puis rallumer (la mise sous
+// tension demarre le loader) ; disposition OTA = redemarrer directement sur le loader.
+[[noreturn]] void finishSelfInstall()
+{
+    if (selfInstallNeedsPowerOff()) waitPowerOff();
+    g_ui.drawMessage(tr("LAUNCHER_DONE"), tr("LAUNCHER_STARTING"), false);
+    gfx.update();
+    g_core.delay_ms(600);
+    restartToLoaderNow();
+}
+
 void onProgress(size_t done, size_t total, void* ctx)
 {
     g_ui.drawProgress((const char*)ctx, done, total);
     gfx.update();
+#if USE_WIFI_STREAM
+    stream_wifi.update();
+#endif
 }
 
 void install(int index)
@@ -104,8 +136,11 @@ void install(int index)
     setLastApp(app.folder);
     g_ui.drawMessage(tr("LAUNCHER_DONE"), tr("LAUNCHER_STARTING"), false);
     gfx.update();
+#if USE_WIFI_STREAM
+    stream_wifi.update();
+#endif
     g_core.delay_ms(600);
-    restart();
+    restartToGame();
 }
 
 // Aide : gauche/droite change de page, B / C / MENU referme.
@@ -121,6 +156,9 @@ void helpScreen()
         if (edge & (GB_KEY_B | GB_KEY_C | GB_KEY_MENU)) break;
         g_ui.drawHelp(page, kPages);
         gfx.update();
+    #if USE_WIFI_STREAM
+        stream_wifi.update();
+    #endif
     }
 }
 
@@ -142,9 +180,12 @@ void optionsScreen()
             setCurrentLanguage(languageAt(idx).code);
         }
         if (edge & (GB_KEY_B | GB_KEY_MENU)) break;
-        if ((held() & GB_KEY_L1) && (held() & GB_KEY_R1)) { if (selectApplication()) restart(); }
+        if ((held() & GB_KEY_L1) && (held() & GB_KEY_R1)) { if (hasApplication()) restartToGame(); }
         g_ui.drawOptions(idx);
         gfx.update();
+    #if USE_WIFI_STREAM
+        stream_wifi.update();
+    #endif
     }
     if (n > 0) setLanguage(languageAt(idx).code);
 }
@@ -154,30 +195,47 @@ void optionsScreen()
 extern "C" void app_main(void)
 {
     g_core.init();
+    gfx.set_refresh_rate(100);
+    /*
+        // check reset reason
+    {
+        esp_reset_reason_t reset_reason = esp_reset_reason();
+        char log_boot[30];
+        snprintf( log_boot, sizeof(log_boot), "code %d", reset_reason );
+        g_ui.drawMessage( "BOOT CODE", log_boot, false);
+        gfx.update();
+        g_core.delay_ms(2000);
+    }*/
+
     settingsInit();
-
-    // Flashe directement (VS Code) dans app0 : on se copie dans app1 pour que
-    // app0 reste disponible aux jeux, puis on redemarre dessus.
-    if (runningFromApp0()) {
-        char title[kMaxTextLen];
-        snprintf(title, sizeof title, "%s", tr("LAUNCHER_SELF_TITLE"));
-        onProgress(0, 1, title);
-        const FlashResult r = installSelfToApp1(onProgress, title);
-        if (r == FlashResult::Ok) {
-            g_ui.drawMessage(tr("LAUNCHER_DONE"), tr("LAUNCHER_STARTING"), false);
-            gfx.update();
-            g_core.delay_ms(600);
-            restart();
-        }
-        showFlashError(r);
-    }
-
-    int selected = 0, top = 0;
     {   // langue enregistree (SD, sinon NVS) avant le premier affichage
         char lang[8];
         if (mountCard() && getLanguage(lang, sizeof lang)) setCurrentLanguage(lang);
         else if (getLanguage(lang, sizeof lang))           setCurrentLanguage(lang);
     }
+
+    // Flashed by idf.py (VS Code), the Launcher lands in "factory" like any game:
+    // copy it into "test" so "factory" stays free for games, then ask for a power cycle
+    // (power-on starts "test").
+    if (runningAsGame()) {
+        // Same image already in "test" (e.g. reset while the copy was still in "factory"):
+        // no need to flash it again.
+        if (compareLoader() == LoaderMatch::Same) finishSelfInstall();
+
+        char title[kMaxTextLen];
+        snprintf(title, sizeof title, "%s", tr("LAUNCHER_SELF_TITLE"));
+        onProgress(0, 1, title);
+        const FlashResult r = installSelfToLoader(onProgress, title);
+        if (r == FlashResult::Ok) finishSelfInstall();
+        showFlashError(r);
+    }
+#if USE_WIFI_STREAM
+    stream_wifi.init(&g_core, &gfx);
+    stream_wifi.connect_ap();
+#endif
+
+
+    int selected = 0, top = 0;
     bool sdOk = rescan(&selected);
 
     // Replace la selection sur la derniere application installee.
@@ -188,6 +246,8 @@ extern "C" void app_main(void)
     }
     int shownPreview = -2;
 
+    Breakout game;
+    uint32_t nextGameTick = 0;
     uint32_t nextRepeat = 0;
     uint16_t lastDir = 0;
 
@@ -198,7 +258,7 @@ extern "C" void app_main(void)
 
         // L1 + R1 : derniere application.
         if ((now & GB_KEY_L1) && (now & GB_KEY_R1)) {
-            if (selectApplication()) restart();
+            if (hasApplication()) restartToGame();
             showMessage(tr("LAUNCHER_NOAPP_TITLE"), tr("LAUNCHER_NOAPP_MSG"), true);
             continue;
         }
@@ -260,7 +320,20 @@ extern "C" void app_main(void)
             shownPreview = selected;
         }
 
-        g_ui.drawBrowser(g_catalog, selected, top, sdOk);
+        if (!sdOk || n == 0) {
+            // Rien a lancer : message bien visible + casse-brique (pas fixe de 16 ms).
+            const uint32_t tg = g_core.get_millis();
+            if (tg >= nextGameTick) {
+                game.step((now & GB_KEY_RIGHT ? 1 : 0) - (now & GB_KEY_LEFT ? 1 : 0), (edge & GB_KEY_A) != 0);
+                nextGameTick = tg + 16;
+            }
+            g_ui.drawErrorGame(game, sdOk);
+        } else {
+            g_ui.drawBrowser(g_catalog, selected, top, sdOk);
+        }
         gfx.update();
+    #if USE_WIFI_STREAM
+        stream_wifi.update();
+    #endif
     }
 }

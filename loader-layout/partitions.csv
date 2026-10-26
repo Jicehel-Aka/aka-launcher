@@ -1,0 +1,13 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# Note: if you have increased the bootloader size, make sure to update the offsets to avoid overlap
+nvs,      data, nvs,     ,        0x6000,
+phy_init, data, phy,     ,        0x1000,
+# factory,  app,  factory, ,        3000K,
+
+# change fot jicehel test
+#app0,app,ota_0,0x10000,3264K,
+#app1,app,ota_1,0x340000,3264K,
+
+#change for bootloader patch : 1MB-64KB for loader, other for application
+loader,  app,  test,    0x10000,  0xF0000
+game,    app,  factory, 0x100000, 0x700000

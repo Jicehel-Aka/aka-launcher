@@ -8,8 +8,9 @@ namespace launcher {
 constexpr const char* kSdRoot        = "/sdcard";
 constexpr const char* kFirmwareName  = "firmware.bin";
 constexpr const char* kMetaName      = "meta.json";
+#define USE_WIFI_STREAM 0
 constexpr const char* kScreenName    = "screen.bmp";   // nom lu par le Launcher d'origine
-constexpr const char* kScreenNameAlt = "screen.bpm";   // ancienne orthographe, toujours acceptee
+constexpr const char* kScreenNameAlt = "screen.bpm";   // ancienne orthographe (faute de frappe), toujours acceptee
 
 constexpr size_t kMaxApps            = 64;     // applications listees
 constexpr size_t kMaxTextLen         = 96;     // titre, auteur...

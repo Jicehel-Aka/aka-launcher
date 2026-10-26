@@ -170,6 +170,36 @@ void Ui::drawBrowser(const Catalog& cat, int selected, int top, bool sdOk)
     text(4, 231, tr("LAUNCHER_FOOTER"), c.text);
 }
 
+void Ui::drawErrorGame(const Breakout& game, bool sdOk)
+{
+    static const Palette c = makePalette();
+    gfx.clear(c.bg);
+
+    gfx.setColor(c.bar);
+    gfx.fillRect(0, 0, 320, 18);
+    text(8, 5, tr("LAUNCHER_TITLE"), c.text);
+
+    // Message : grand bandeau plein, texte blanc sur fond rouge, centre.
+    gfx.setColor(c.err);
+    gfx.fillRect(8, 24, 304, 48);
+    const char* l1 = sdOk ? tr("LAUNCHER_NO_APP1") : tr("LAUNCHER_SD_MISSING1");
+    const char* l2 = sdOk ? tr("LAUNCHER_NO_APP3") : tr("LAUNCHER_SD_MISSING2");
+    text(160 - (int)strlen(l1) * 4, 30, l1, c.selText);
+    text(160 - (int)strlen(l2) * 4, 44, l2, c.selText);
+    const char* rt = tr("LAUNCHER_SD_RETRY");
+    text(160 - (int)strlen(rt) * 4, 58, rt, c.selText);
+
+    const uint16_t rows[Breakout::kRows] = { c.err, c.accent, c.ok, c.selBg };
+    game.draw(8, 90, c.panel, c.frame, c.selText, c.accent, rows, c.dim);
+
+    const char* hint = tr("LAUNCHER_GAME_HINT");
+    text(160 - (int)strlen(hint) * 4, 78, hint, c.dim);
+
+    gfx.setColor(c.bar);
+    gfx.fillRect(0, 228, 320, 12);
+    text(4, 231, tr("LAUNCHER_FOOTER"), c.text);
+}
+
 void Ui::drawMessage(const char* title, const char* msg, bool error)
 {
     static const Palette c = makePalette();

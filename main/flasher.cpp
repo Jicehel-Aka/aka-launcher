@@ -1,8 +1,7 @@
 #include "flasher.h"
 
-#include <cstdio>
-#include <cerrno>
 #include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -11,9 +10,10 @@
 #include "esp_image_format.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
+#include "esp_rom_crc.h"
 #include "esp_system.h"
+#include "spi_flash_mmap.h"
 #include "launcher_config.h"
-#include "mbedtls/sha256.h"
 
 namespace launcher {
 
@@ -22,76 +22,96 @@ namespace {
 const char* TAG = "flasher";
 constexpr uint8_t kImageMagic = 0xE9;   // ESP_IMAGE_HEADER_MAGIC
 
-// Partition de l'application : la premiere de sous-type OTA_0 (comme le fait
-// la table de partitions de la console, sans offset code en dur).
-const esp_partition_t* applicationPartition()
+struct Parts {
+    Layout layout = Layout::None;
+    const esp_partition_t* game = nullptr;     // application installee
+    const esp_partition_t* loader = nullptr;   // le Launcher
+};
+
+const Parts& parts()
 {
-    return esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, nullptr);
+    static Parts p;
+    static bool done = false;
+    if (done) return p;
+    done = true;
+    auto find = [](esp_partition_subtype_t sub) {
+        return esp_partition_find_first(ESP_PARTITION_TYPE_APP, sub, nullptr);
+    };
+    const esp_partition_t* test = find(ESP_PARTITION_SUBTYPE_APP_TEST);
+    const esp_partition_t* fact = find(ESP_PARTITION_SUBTYPE_APP_FACTORY);
+    const esp_partition_t* ota0 = find(ESP_PARTITION_SUBTYPE_APP_OTA_0);
+    const esp_partition_t* ota1 = find(ESP_PARTITION_SUBTYPE_APP_OTA_1);
+    if (test && fact)      { p.layout = Layout::ResetReason; p.game = fact; p.loader = test; }
+    else if (ota0 && ota1) { p.layout = Layout::Ota;         p.game = ota0; p.loader = ota1; }
+    return p;
 }
 
-char g_detail[220];
+// ---------------------------------------------------------------- details d'erreur
+char g_detail[240];
 
-// Ajoute une ligne au detail (et la journalise).
-void detailClear() { g_detail[0] = '\0'; }
-void detailAdd(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
-void detailAdd(const char* fmt, ...)
+void detailf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+void detailf(const char* fmt, ...)
 {
-    char line[48];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(line, sizeof line, fmt, ap);
+    vsnprintf(g_detail, sizeof g_detail, fmt, ap);
     va_end(ap);
-    ESP_LOGE(TAG, "%s", line);
-    const size_t len = strlen(g_detail);
-    if (len + strlen(line) + 2 < sizeof g_detail) {
-        snprintf(g_detail + len, sizeof g_detail - len, "%s%s", len ? "\n" : "", line);
+    ESP_LOGW(TAG, "%s", g_detail);
+}
+
+const char* layoutName()
+{
+    switch (parts().layout) {
+    case Layout::ResetReason: return "loader/game";
+    case Layout::Ota:         return "app1/app0";
+    default:                  return "?";
     }
 }
 
-// Version courte du nom d'erreur ("ESP_ERR_OTA_VALIDATE_FAILED" -> "OTA_VALIDATE_FAILED").
-const char* shortName(esp_err_t e)
+// Verifie qu'une partition contient une image d'application complete (checksum + SHA-256).
+esp_err_t imageCheck(const esp_partition_t* p)
 {
-    const char* n = esp_err_to_name(e);
-    return strncmp(n, "ESP_ERR_", 8) == 0 ? n + 8 : n;
+    if (!p) return ESP_ERR_NOT_FOUND;
+    esp_partition_pos_t pos = {p->address, p->size};
+    esp_image_metadata_t meta;
+    return esp_image_verify(ESP_IMAGE_VERIFY_SILENT, &pos, &meta);
 }
+bool imageValid(const esp_partition_t* p) { return imageCheck(p) == ESP_OK; }
 
-void hex8(const uint8_t* h, char* out)   // 4 premiers octets d'un hash -> "a1b2c3d4"
+// Ecriture sequentielle avec effacement a la volee : chaque secteur est efface juste avant
+// son premier octet, donc seul ce qui est ecrit est efface et la progression reste fluide.
+esp_err_t writeErasing(const esp_partition_t* p, size_t offset, const void* data, size_t len)
 {
-    for (int i = 0; i < 4; ++i) sprintf(out + 2 * i, "%02x", h[i]);
-}
-
-// Apres un echec de esp_ota_end : relit la partition en direct (sans passer par
-// le cache) et compare son SHA-256 a celui du fichier lu sur la SD.
-void diagnoseReadback(const esp_partition_t* part, size_t total, const uint8_t* fileHash)
-{
-    uint8_t* buf = (uint8_t*)malloc(kFlashChunk);
-    if (!buf) { detailAdd("relecture: pas de memoire"); return; }
-    mbedtls_sha256_context c;
-    mbedtls_sha256_init(&c);
-    mbedtls_sha256_starts(&c, 0);
-    uint8_t first[8] = {0};
-    bool readOk = true;
-    for (size_t off = 0; off < total; off += kFlashChunk) {
-        const size_t n = (total - off < kFlashChunk) ? (total - off) : kFlashChunk;
-        if (esp_partition_read(part, off, buf, n) != ESP_OK) { readOk = false; break; }
-        if (off == 0) memcpy(first, buf, 8);
-        mbedtls_sha256_update(&c, buf, n);
+    const size_t end = offset + len;
+    for (size_t s = (offset + SPI_FLASH_SEC_SIZE - 1) / SPI_FLASH_SEC_SIZE * SPI_FLASH_SEC_SIZE; s < end;
+         s += SPI_FLASH_SEC_SIZE) {
+        const esp_err_t err = esp_partition_erase_range(p, s, SPI_FLASH_SEC_SIZE);
+        if (err != ESP_OK) return err;
     }
-    uint8_t h[32];
-    mbedtls_sha256_finish(&c, h);
-    mbedtls_sha256_free(&c);
+    return esp_partition_write(p, offset, data, len);
+}
+
+// CRC32 de la partition relue (sans passer par le cache), sur `len` octets.
+bool partitionCrc(const esp_partition_t* p, size_t len, uint32_t* crc)
+{
+    uint8_t* buf = (uint8_t*)heap_caps_malloc(kFlashChunk, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!buf) return false;
+    uint32_t c = 0;
+    bool ok = true;
+    for (size_t off = 0; off < len;) {
+        const size_t n = (len - off < kFlashChunk) ? (len - off) : kFlashChunk;
+        if (esp_partition_read(p, off, buf, n) != ESP_OK) { ok = false; break; }
+        c = esp_rom_crc32_le(c, buf, n);
+        off += n;
+    }
     free(buf);
-    char a[9], b[9];
-    hex8(fileHash, a);
-    hex8(h, b);
-    if (!readOk) detailAdd("relecture flash impossible");
-    else if (memcmp(h, fileHash, 32) == 0) detailAdd("flash=fichier (sha %s) OK", a);
-    else detailAdd("flash!=fichier %s/%s", b, a);
-    ESP_LOGE(TAG, "partition %s: octets 0..7 = %02x %02x %02x %02x %02x %02x %02x %02x",
-             part->label, first[0], first[1], first[2], first[3], first[4], first[5], first[6], first[7]);
+    *crc = c;
+    return ok;
 }
 
 }  // namespace
+
+Layout layout() { return parts().layout; }
 
 const char* lastErrorDetail() { return g_detail; }
 
@@ -116,171 +136,208 @@ const char* errorKey(FlashResult r)
 
 FlashResult flashApp(const char* path, ProgressFn progress, void* ctx)
 {
-    detailClear();
-    const esp_partition_t* target = applicationPartition();
-    const esp_partition_t* run = esp_ota_get_running_partition();
-    ESP_LOGI(TAG, "flash: %s", path);
-    ESP_LOGI(TAG, "  tourne sur : %s @0x%x", run ? run->label : "?", run ? (unsigned)run->address : 0);
-    if (target)
-        ESP_LOGI(TAG, "  cible      : %s @0x%x taille 0x%x", target->label, (unsigned)target->address, (unsigned)target->size);
-    if (!target) { detailAdd("pas de partition app0 (OTA_0)"); return FlashResult::NoTargetPartition; }
-    if (target == run) { detailAdd("on tourne sur %s : ecriture refusee", target->label); return FlashResult::TargetIsRunning; }
+    g_detail[0] = 0;
+    const Parts& P = parts();
+    const esp_partition_t* target = P.game;
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    if (!target) { detailf("layout=%s: partition du jeu absente", layoutName()); return FlashResult::NoTargetPartition; }
+    if (target == running) {
+        detailf("tourne depuis %s = cible", running->label);
+        return FlashResult::TargetIsRunning;
+    }
 
     FILE* f = fopen(path, "rb");
-    if (!f) { detailAdd("ouverture SD impossible (errno %d)", errno); return FlashResult::OpenFailed; }
+    if (!f) { detailf("fopen %s", path); return FlashResult::OpenFailed; }
 
     fseek(f, 0, SEEK_END);
     const long total = ftell(f);
     fseek(f, 0, SEEK_SET);
-    ESP_LOGI(TAG, "  fichier    : %ld octets", total);
-    if (total < 32) { fclose(f); detailAdd("fichier trop petit (%ld)", total); return FlashResult::NotAnImage; }
-    if ((size_t)total > target->size) { fclose(f); detailAdd("fichier %ld > app0 %u", total, (unsigned)target->size); return FlashResult::TooBig; }
+    if (total < 32) { fclose(f); detailf("fichier trop court (%ld octets)", total); return FlashResult::NotAnImage; }
+    if ((size_t)total > target->size) {
+        fclose(f);
+        detailf("%ld octets > %u (%s)", total, (unsigned)target->size, target->label);
+        return FlashResult::TooBig;
+    }
 
     uint8_t* buf = (uint8_t*)malloc(kFlashChunk);
-    if (!buf) { fclose(f); detailAdd("memoire insuffisante"); return FlashResult::BeginFailed; }
+    if (!buf) { fclose(f); detailf("malloc %u", (unsigned)kFlashChunk); return FlashResult::BeginFailed; }
 
     FlashResult result = FlashResult::Ok;
-    esp_ota_handle_t handle = 0;
-    bool begun = false;
-    size_t written = 0, shortReads = 0;
-    mbedtls_sha256_context sha;
-    mbedtls_sha256_init(&sha);
-    mbedtls_sha256_starts(&sha, 0);
-    uint8_t fileHash[32] = {0};
-    esp_err_t err = ESP_OK;
+    size_t written = 0;
+    unsigned shortReads = 0;
+    uint32_t fileCrc = 0;
 
     do {
-        // Premier bloc : controle de l'en-tete avant d'effacer quoi que ce soit.
+        // Premier bloc : on verifie l'en-tete avant d'effacer quoi que ce soit.
         size_t n = fread(buf, 1, kFlashChunk, f);
-        if (n == 0) { detailAdd("lecture SD: 0 octet (errno %d)", errno); result = FlashResult::ReadFailed; break; }
-        if (buf[0] != kImageMagic) { detailAdd("en-tete: 0x%02x au lieu de 0xE9", buf[0]); result = FlashResult::NotAnImage; break; }
-
-        err = esp_ota_begin(target, (size_t)total, &handle);
-        if (err != ESP_OK) {
-            detailAdd("ota_begin 0x%x", (unsigned)err);
-            detailAdd("%s", shortName(err));
-            result = FlashResult::BeginFailed;
+        if (n == 0) { detailf("read @0: n=0"); result = FlashResult::ReadFailed; break; }
+        if (buf[0] != kImageMagic) {
+            detailf("en-tete 0x%02x (attendu 0xE9)", buf[0]);
+            result = FlashResult::NotAnImage;
             break;
         }
-        begun = true;
 
         while (true) {
-            mbedtls_sha256_update(&sha, buf, n);
-            err = esp_ota_write(handle, buf, n);
-            if (err != ESP_OK) {
-                detailAdd("ota_write 0x%x a l'offset %u", (unsigned)err, (unsigned)written);
-                detailAdd("%s", shortName(err));
+            const esp_err_t e = writeErasing(target, written, buf, n);
+            if (e != ESP_OK) {
+                detailf("ecriture @0x%x: %s (0x%x)", (unsigned)written, esp_err_to_name(e), (unsigned)e);
                 result = FlashResult::WriteFailed;
                 break;
             }
+            fileCrc = esp_rom_crc32_le(fileCrc, buf, n);
             written += n;
             if (progress) progress(written, (size_t)total, ctx);
             if (written >= (size_t)total) break;
-            n = fread(buf, 1, kFlashChunk, f);
+
+            const size_t want = ((size_t)total - written < kFlashChunk) ? ((size_t)total - written) : kFlashChunk;
+            n = fread(buf, 1, want, f);
+            if (n < want) {                       // lecture SD incomplete : une seconde chance
+                shortReads++;
+                const size_t more = fread(buf + n, 1, want - n, f);
+                n += more;
+            }
             if (n == 0) {
-                detailAdd("SD: fin a %u/%ld (errno %d)", (unsigned)written, total, errno);
+                detailf("read @0x%x: n=0 (SD courtes: %u)", (unsigned)written, shortReads);
                 result = FlashResult::ReadFailed;
                 break;
             }
-            if (n != kFlashChunk && written + n < (size_t)total) ++shortReads;   // lecture SD incomplete au milieu du fichier
         }
         if (result != FlashResult::Ok) break;
-        mbedtls_sha256_finish(&sha, fileHash);
 
-        // Valide l'image (somme de controle + hash) et l'ecrit comme valide.
-        err = esp_ota_end(handle);
-        begun = false;
-        if (err != ESP_OK) {
-            detailAdd("ota_end 0x%x", (unsigned)err);
-            detailAdd("%s", shortName(err));
-            detailAdd("ecrit %u/%ld, SD courtes: %u", (unsigned)written, total, (unsigned)shortReads);
-            diagnoseReadback(target, written, fileHash);
+        // Une image partielle ou corrompue est rejetee ici, et aussi par le bootloader.
+        const esp_err_t v = imageCheck(target);
+        uint32_t flashCrc = 0;
+        const bool readOk = partitionCrc(target, written, &flashCrc);
+        const char* cmp = !readOk ? "relecture impossible" : (flashCrc == fileCrc ? "flash=fichier" : "flash!=fichier");
+        if (v != ESP_OK) {
+            detailf("verif image: %s (0x%x)\necrit %u/%ld, SD courtes: %u\n%s crc %08x/%08x",
+                    esp_err_to_name(v), (unsigned)v, (unsigned)written, total, shortReads,
+                    cmp, (unsigned)fileCrc, (unsigned)flashCrc);
             result = FlashResult::ValidationFailed;
-            break;
-        }
-
-        err = esp_ota_set_boot_partition(target);
-        if (err != ESP_OK) {
-            detailAdd("set_boot 0x%x", (unsigned)err);
-            detailAdd("%s", shortName(err));
-            result = FlashResult::SetBootFailed;
+        } else {
+            detailf("OK %s: %u octets, SD courtes: %u\n%s crc %08x",
+                    target->label, (unsigned)written, shortReads, cmp, (unsigned)fileCrc);
         }
     } while (false);
 
-    mbedtls_sha256_free(&sha);
-    if (begun) esp_ota_abort(handle);
+    if (result != FlashResult::Ok && g_detail[0]) {
+        char tmp[sizeof g_detail + 80];
+        const int len = snprintf(tmp, sizeof tmp, "%s\n[%s] run=%s cible=%s", g_detail, layoutName(),
+                                 running ? running->label : "?", target->label);
+        const size_t keep = (len > 0 && (size_t)len < sizeof g_detail) ? (size_t)len : sizeof g_detail - 1;
+        memcpy(g_detail, tmp, keep);
+        g_detail[keep] = 0;
+    }
+
     free(buf);
     fclose(f);
-    ESP_LOGI(TAG, "flash %s -> %s (%u octets ecrits, %u lectures SD courtes)", path, errorKey(result),
-             (unsigned)written, (unsigned)shortReads);
+    ESP_LOGI(TAG, "flash %s -> %s", path, errorKey(result));
     return result;
 }
 
-bool runningFromApp0()
+bool runningAsGame()
 {
     const esp_partition_t* run = esp_ota_get_running_partition();
-    return run && run->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0;
+    return run && parts().game && run->address == parts().game->address;
 }
 
-FlashResult installSelfToApp1(ProgressFn progress, void* ctx)
+FlashResult installSelfToLoader(ProgressFn progress, void* ctx)
 {
-    detailClear();
+    g_detail[0] = 0;
     const esp_partition_t* src = esp_ota_get_running_partition();
-    if (!src || src->subtype != ESP_PARTITION_SUBTYPE_APP_OTA_0) return FlashResult::NotApplicable;
-    const esp_partition_t* dst =
-        esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, nullptr);
-    if (!dst) { detailAdd("pas de partition app1 (OTA_1)"); return FlashResult::NoTargetPartition; }
+    if (!runningAsGame()) return FlashResult::NotApplicable;
+    const esp_partition_t* dst = parts().loader;
+    if (!dst) { detailf("layout=%s: loader absent", layoutName()); return FlashResult::NoTargetPartition; }
 
-    // Longueur reelle de l'image (en-tete + segments + somme + hash).
+    // Longueur reelle de l'image (en-tete + segments + checksum + hash).
     esp_partition_pos_t pos = {src->address, src->size};
     esp_image_metadata_t meta;
-    if (esp_image_get_metadata(&pos, &meta) != ESP_OK) { detailAdd("image courante illisible"); return FlashResult::NotAnImage; }
+    const esp_err_t m = esp_image_get_metadata(&pos, &meta);
+    if (m != ESP_OK) { detailf("metadata %s: %s", src->label, esp_err_to_name(m)); return FlashResult::NotAnImage; }
     const size_t total = meta.image_len;
-    if (total > dst->size) { detailAdd("image %u > app1 %u", (unsigned)total, (unsigned)dst->size); return FlashResult::TooBig; }
+    if (total > dst->size) {
+        detailf("%u octets > %u (%s)", (unsigned)total, (unsigned)dst->size, dst->label);
+        return FlashResult::TooBig;
+    }
 
     uint8_t* buf = (uint8_t*)heap_caps_malloc(kFlashChunk, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!buf) return FlashResult::BeginFailed;
 
     FlashResult result = FlashResult::Ok;
-    esp_ota_handle_t handle = 0;
-    esp_err_t e = esp_ota_begin(dst, total, &handle);
-    if (e != ESP_OK) {
-        detailAdd("ota_begin 0x%x", (unsigned)e);
-        free(buf);
-        return FlashResult::BeginFailed;
-    }
-    for (size_t off = 0; off < total && result == FlashResult::Ok;) {
+    for (size_t off = 0; off < total;) {
         const size_t n = (total - off < kFlashChunk) ? (total - off) : kFlashChunk;
-        e = esp_partition_read(src, off, buf, n);
-        if (e != ESP_OK) { detailAdd("lecture app0 0x%x @%u", (unsigned)e, (unsigned)off); result = FlashResult::ReadFailed; break; }
-        e = esp_ota_write(handle, buf, n);
-        if (e != ESP_OK) { detailAdd("ota_write 0x%x @%u", (unsigned)e, (unsigned)off); result = FlashResult::WriteFailed; break; }
+        esp_err_t e = esp_partition_read(src, off, buf, n);
+        if (e != ESP_OK) { detailf("lecture %s @0x%x: %s", src->label, (unsigned)off, esp_err_to_name(e)); result = FlashResult::ReadFailed; break; }
+        e = writeErasing(dst, off, buf, n);
+        if (e != ESP_OK) { detailf("ecriture %s @0x%x: %s", dst->label, (unsigned)off, esp_err_to_name(e)); result = FlashResult::WriteFailed; break; }
         off += n;
         if (progress) progress(off, total, ctx);
     }
-    if (result == FlashResult::Ok) {
-        e = esp_ota_end(handle);
-        if (e != ESP_OK) { detailAdd("ota_end 0x%x", (unsigned)e); detailAdd("%s", shortName(e)); result = FlashResult::ValidationFailed; }
-        else if ((e = esp_ota_set_boot_partition(dst)) != ESP_OK) { detailAdd("set_boot 0x%x", (unsigned)e); result = FlashResult::SetBootFailed; }
-    } else {
-        esp_ota_abort(handle);
-    }
     free(buf);
-    ESP_LOGI(TAG, "self install app0 -> app1: %s", errorKey(result));
+    if (result == FlashResult::Ok) {
+        const esp_err_t v = imageCheck(dst);
+        if (v != ESP_OK) { detailf("verif %s: %s (0x%x)", dst->label, esp_err_to_name(v), (unsigned)v); result = FlashResult::ValidationFailed; }
+    }
+
+    // La copie laissee dans la partition du jeu est conservee (ecrire dans la partition en cours
+    // d'execution fait un abort : CONFIG_SPI_FLASH_DANGEROUS_WRITE_ABORTS) ; compareLoader() la
+    // rend inoffensive.
+    ESP_LOGI(TAG, "auto-installation %s -> %s : %s", src->label, dst->label, errorKey(result));
     return result;
 }
 
-bool selectApplication()
+bool selfInstallNeedsPowerOff() { return parts().layout == Layout::ResetReason; }
+
+[[noreturn]] void restartToLoaderNow()
 {
-    const esp_partition_t* app = applicationPartition();
-    if (!app) return false;
-    uint8_t magic = 0;
-    if (esp_partition_read(app, 0, &magic, 1) != ESP_OK || magic != kImageMagic) return false;
-    return esp_ota_set_boot_partition(app) == ESP_OK;
+    const esp_partition_t* l = parts().loader;
+    if (l && parts().layout == Layout::Ota) {
+        const esp_err_t e = esp_ota_set_boot_partition(l);
+        ESP_LOGI(TAG, "boot -> %s : %s", l->label, esp_err_to_name(e));
+    }
+    esp_restart();
+    while (true) {}
 }
 
-[[noreturn]] void restart()
+LoaderMatch compareLoader()
 {
+    const esp_partition_t* game = parts().game;
+    const esp_partition_t* loader = parts().loader;
+    if (!game || !loader) return LoaderMatch::Error;
+
+    // Longueur de l'image de la partition du jeu ; pas d'image valide = rien a comparer.
+    esp_partition_pos_t pos = {game->address, game->size};
+    esp_image_metadata_t meta;
+    if (esp_image_get_metadata(&pos, &meta) != ESP_OK) return LoaderMatch::Different;
+    const size_t total = meta.image_len;
+    if (total > loader->size) return LoaderMatch::Different;
+
+    uint8_t* a = (uint8_t*)heap_caps_malloc(2 * kFlashChunk, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!a) return LoaderMatch::Error;
+    uint8_t* b = a + kFlashChunk;
+
+    LoaderMatch result = LoaderMatch::Same;
+    for (size_t off = 0; off < total;) {
+        const size_t n = (total - off < kFlashChunk) ? (total - off) : kFlashChunk;
+        if (esp_partition_read(game, off, a, n) != ESP_OK ||
+            esp_partition_read(loader, off, b, n) != ESP_OK) { result = LoaderMatch::Error; break; }
+        if (memcmp(a, b, n) != 0) { result = LoaderMatch::Different; break; }
+        off += n;
+    }
+    free(a);
+    return result;
+}
+
+bool hasApplication()
+{
+    const esp_partition_t* app = parts().game;
+    return app && app != esp_ota_get_running_partition() && imageValid(app);
+}
+
+[[noreturn]] void restartToGame()
+{
+    const esp_partition_t* g = parts().game;
+    if (g && parts().layout == Layout::Ota) esp_ota_set_boot_partition(g);
     esp_restart();
     while (true) {}
 }

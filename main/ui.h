@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include "catalog.h"
+#include "breakout.h"
 
 namespace launcher {
 
@@ -15,6 +16,9 @@ public:
 
     // Ecran principal : liste a gauche, apercu + fiche a droite.
     void drawBrowser(const Catalog& cat, int selected, int top, bool sdOk);
+
+    // Ecran "rien a lancer" (SD absente / illisible / aucune appli) : message bien visible + casse-brique.
+    void drawErrorGame(const Breakout& game, bool sdOk);
 
     // Ecran d'information (message centre, plusieurs lignes separees par '\n').
     void drawMessage(const char* title, const char* text, bool error);
